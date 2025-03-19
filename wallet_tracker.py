@@ -28,6 +28,9 @@ class WalletTracker:
         print(f"Initializing Web3 with Infura key: {self.infura_api_key[:6]}...")
         
         self.chex_contract = '0x9Ce84F6A69986a83d92C324df10bC8E64771030f'
+        self.aave_contract = '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'
+        self.doge_contract = '0x4206931337dc273a630d328dA6441786BfaD668f'  # Wrapped DOGE on Ethereum
+        
         try:
             # Connect to Ethereum mainnet
             infura_url = f"https://mainnet.infura.io/v3/{self.infura_api_key}"
@@ -55,16 +58,24 @@ class WalletTracker:
         self.transaction_sequences = defaultdict(list)
         self.gas_price_history = []
         
-        # Initialize other existing attributes
-        self.xrp_addresses = {
-            'Binance': 'rEb8TK3gBgk5auZkwc6sHnwrGVJH8DuaLh',
-            'Bitstamp': 'rrpNnNLKrartuEqfJGpqyDwPj1AFPg9vn1',
-            'Bitso': 'rG6FZ31hDHN1K5Dkbma3PSB5uVCuVVRzfn',
-            'Binance Hot Wallet': 'rJb5KsHsDHF1YS5B5DU6QCkH5NsPaKQTcy',
-            'Crypto.com': 'rU2mEJSLqBRkYLVTv55rFTgQajkLTnT6mA'
+        # Initialize exchange addresses for DOGE and AAVE
+        self.doge_addresses = {
+            'Binance': '0x28C6c06298d514Db089934071355E5743bf21d60',
+            'Bitfinex': '0x77134cbC06cB00b66F4c7e623D5fdBF6777635EC',
+            'Kraken': '0x2B5634C42055806a59e9107ED44D43c426E58258',
+            'Binance Hot Wallet': '0x8894E0a0c962CB723c1976a4421c95949bE2D4E3',
+            'Crypto.com': '0x6262998Ced04146fA42253a5C0AF90CA02dfd2A3'
         }
         
-        self.balance_history_file = 'xrp_balance_history.json'
+        self.aave_addresses = {
+            'Binance': '0x28C6c06298d514Db089934071355E5743bf21d60',
+            'Aave Treasury': '0x25F2226B597E8F9514B3F68F00f494cF4f286491',
+            'Aave Collector': '0x464C71f6c2F760DdA6093dCB91C24c39e5d6e18c',
+            'Binance Hot Wallet': '0x8894E0a0c962CB723c1976a4421c95949bE2D4E3',
+            'Crypto.com': '0x6262998Ced04146fA42253a5C0AF90CA02dfd2A3'
+        }
+        
+        self.balance_history_file = 'token_balance_history.json'
         self.load_balance_history()
 
     def identify_wallet_cluster(self, address):
@@ -220,24 +231,34 @@ class WalletTracker:
         with open(self.balance_history_file, 'w') as f:
             json.dump(self.balance_history, f, indent=2)
             
-    def get_chex_transfers(self, hours=24):
-        """Fetch CHEX token transfers for the last n hours"""
+    def get_token_transfers(self, token_type, hours=24):
+        """Fetch token transfers for the last n hours"""
         endpoint = 'https://api.etherscan.io/api'
         
         # Calculate timestamp for n hours ago
         current_time = datetime.now()
         start_time = int((current_time - timedelta(hours=hours)).timestamp())
         
+        contract_address = {
+            'CHEX': self.chex_contract,
+            'AAVE': self.aave_contract,
+            'DOGE': self.doge_contract
+        }.get(token_type)
+        
+        if not contract_address:
+            print(f"Invalid token type: {token_type}")
+            return []
+        
         params = {
             'module': 'account',
             'action': 'tokentx',
-            'contractaddress': self.chex_contract,
+            'contractaddress': contract_address,
             'starttime': start_time,
             'sort': 'desc',
             'apikey': self.etherscan_api_key
         }
         
-        print(f"Fetching CHEX transfers since {datetime.fromtimestamp(start_time)}")
+        print(f"Fetching {token_type} transfers since {datetime.fromtimestamp(start_time)}")
         response = requests.get(endpoint, params=params)
         if response.status_code == 200:
             data = response.json()
@@ -251,61 +272,83 @@ class WalletTracker:
             print(f"HTTP error {response.status_code} from Etherscan API")
         return []
 
-    def get_xrp_movements(self, hours=24):
-        """Track XRP balance changes for major exchanges with historical comparison"""
-        base_url = 'https://api.xrpscan.com/api/v1'
+    def get_token_movements(self, token_type, hours=24):
+        """Track token balance changes for major exchanges with historical comparison"""
         movements = []
         current_time = int(datetime.now().timestamp())
         
         # Get current balances and update history
-        print(f"\nFetching XRP exchange balances")
+        print(f"\nFetching {token_type} exchange balances")
         current_balances = {}
         
-        for name, address in self.xrp_addresses.items():
+        addresses = {
+            'DOGE': self.doge_addresses,
+            'AAVE': self.aave_addresses
+        }.get(token_type, {})
+        
+        for name, address in addresses.items():
             try:
-                endpoint = f"{base_url}/account/{address}"
-                response = requests.get(endpoint)
+                # Get token balance using Web3
+                contract_address = {
+                    'DOGE': self.doge_contract,
+                    'AAVE': self.aave_contract
+                }.get(token_type)
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    balance = float(data.get('xrpBalance', 0))
-                    current_balances[address] = balance
-                    print(f"{name}: {balance:,.2f} XRP")
-                    
-                    # Update balance history
-                    if address not in self.balance_history:
-                        self.balance_history[address] = []
-                    
-                    # Add new balance point
-                    self.balance_history[address].append({
-                        'timestamp': current_time,
-                        'balance': balance
-                    })
-                    
-                    # Clean up old history (keep last 7 days)
-                    cutoff_time = current_time - (7 * 24 * 3600)
-                    self.balance_history[address] = [
-                        point for point in self.balance_history[address]
-                        if point['timestamp'] > cutoff_time
-                    ]
-                    
-                    # Compare with historical balances
-                    historical_points = self.balance_history[address]
-                    for point in historical_points:
-                        if current_time - point['timestamp'] <= hours * 3600:
-                            change = balance - point['balance']
-                            if abs(change) >= 50000:  # Lowered threshold to 50k XRP
-                                movements.append({
-                                    'source': name if change < 0 else 'Unknown',
-                                    'destination': 'Unknown' if change < 0 else name,
-                                    'amount': abs(change),
-                                    'timestamp': current_time,
-                                    'previous_balance': point['balance'],
-                                    'current_balance': balance,
-                                    'time_difference': f"{(current_time - point['timestamp']) / 3600:.1f} hours"
-                                })
-                else:
-                    print(f"Error fetching balance for {name}: {response.text}")
+                if not contract_address:
+                    continue
+                
+                # Create contract instance
+                contract = self.w3.eth.contract(
+                    address=self.w3.to_checksum_address(contract_address),
+                    abi=[{
+                        "constant": True,
+                        "inputs": [{"name": "_owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function"
+                    }]
+                )
+                
+                # Get balance
+                balance = contract.functions.balanceOf(self.w3.to_checksum_address(address)).call()
+                balance = float(self.w3.from_wei(balance, 'ether'))
+                current_balances[address] = balance
+                print(f"{name}: {balance:,.2f} {token_type}")
+                
+                # Update balance history
+                if address not in self.balance_history:
+                    self.balance_history[address] = []
+                
+                # Add new balance point
+                self.balance_history[address].append({
+                    'timestamp': current_time,
+                    'balance': balance,
+                    'token': token_type
+                })
+                
+                # Clean up old history (keep last 7 days)
+                cutoff_time = current_time - (7 * 24 * 3600)
+                self.balance_history[address] = [
+                    point for point in self.balance_history[address]
+                    if point['timestamp'] > cutoff_time
+                ]
+                
+                # Compare with historical balances
+                historical_points = [p for p in self.balance_history[address] if p['token'] == token_type]
+                for point in historical_points:
+                    if current_time - point['timestamp'] <= hours * 3600:
+                        change = balance - point['balance']
+                        threshold = 50000 if token_type == 'DOGE' else 100 if token_type == 'AAVE' else 10000
+                        if abs(change) >= threshold:
+                            movements.append({
+                                'source': name if change < 0 else 'Unknown',
+                                'destination': 'Unknown' if change < 0 else name,
+                                'amount': abs(change),
+                                'timestamp': current_time,
+                                'previous_balance': point['balance'],
+                                'current_balance': balance,
+                                'time_difference': f"{(current_time - point['timestamp']) / 3600:.1f} hours"
+                            })
             except Exception as e:
                 print(f"Error processing {name}: {e}")
         
@@ -322,26 +365,15 @@ class WalletTracker:
         
         for tx in movements:
             try:
-                if token_type == 'CHEX':
+                if token_type in ['CHEX', 'DOGE', 'AAVE']:
                     amount = float(self.w3.from_wei(int(tx['value']), 'ether'))
                     if amount >= min_amount:
                         large_moves.append({
-                            'token': 'CHEX',
+                            'token': token_type,
                             'from': tx['from'],
                             'to': tx['to'],
                             'amount': amount,
                             'timestamp': datetime.fromtimestamp(int(tx['timeStamp']))
-                        })
-                elif token_type == 'XRP':
-                    amount = float(tx['amount'])
-                    if amount >= min_amount:
-                        large_moves.append({
-                            'token': 'XRP',
-                            'from': tx['source'],
-                            'to': tx['destination'],
-                            'amount': amount,
-                            'timestamp': datetime.fromtimestamp(tx['timestamp']),
-                            'details': f"Balance change: {tx['previous_balance']:,.2f} → {tx['current_balance']:,.2f} ({tx['time_difference']} ago)"
                         })
             except Exception as e:
                 print(f"Error processing {token_type} transaction: {e}")
@@ -353,14 +385,32 @@ class WalletTracker:
 
     def generate_enhanced_report(self, hours=24):
         """Generate an enhanced report including wallet clustering and pattern analysis"""
-        # Get basic CHEX transfers
-        chex_moves = self.get_chex_transfers(hours)
+        # Get token transfers
+        chex_moves = self.get_token_transfers('CHEX', hours)
+        doge_moves = self.get_token_transfers('DOGE', hours)
+        aave_moves = self.get_token_transfers('AAVE', hours)
         
         # Analyze each unique address involved in large transfers
         analyzed_addresses = set()
         detailed_analysis = []
         
         for tx in chex_moves:
+            for address in [tx['from'], tx['to']]:
+                if address not in analyzed_addresses:
+                    analysis = self.analyze_wallet_movement(address, hours)
+                    if analysis:
+                        detailed_analysis.append(analysis)
+                    analyzed_addresses.add(address)
+        
+        for tx in doge_moves:
+            for address in [tx['from'], tx['to']]:
+                if address not in analyzed_addresses:
+                    analysis = self.analyze_wallet_movement(address, hours)
+                    if analysis:
+                        detailed_analysis.append(analysis)
+                    analyzed_addresses.add(address)
+        
+        for tx in aave_moves:
             for address in [tx['from'], tx['to']]:
                 if address not in analyzed_addresses:
                     analysis = self.analyze_wallet_movement(address, hours)
@@ -376,8 +426,8 @@ class WalletTracker:
         for analysis in detailed_analysis:
             report += f"\nAddress: {analysis['address']}\n"
             report += f"Cluster Type: {analysis['cluster_type']}\n"
-            report += f"Total CHEX In: {analysis['total_incoming']:,.2f}\n"
-            report += f"Total CHEX Out: {analysis['total_outgoing']:,.2f}\n"
+            report += f"Total {analysis['token']} In: {analysis['total_incoming']:,.2f}\n"
+            report += f"Total {analysis['token']} Out: {analysis['total_outgoing']:,.2f}\n"
             report += f"Transaction Count: {analysis['transaction_count']}\n"
             report += f"Total Gas Spent: {analysis['total_gas_spent']:.4f} ETH\n"
         
