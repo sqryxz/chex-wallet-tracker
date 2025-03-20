@@ -23,14 +23,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants for optimization
-CHUNK_SIZE = 2  # Reduced chunk size for faster processing
-MAX_WORKERS = 2  # Increased workers for parallel processing
+CHUNK_SIZE = 5  # Increased from 2 to 5 for faster batch processing
+MAX_WORKERS = 4  # Increased from 2 to 4 for more parallel processing
 CACHE_TTL = 3600  # Cache TTL in seconds
-MAX_CONCURRENT_REQUESTS = 2  # Increased concurrent requests
-REQUEST_DELAY = 5.0  # Reduced delay between requests
-ETHERSCAN_RATE_LIMIT = 0.2  # Increased rate to 1 request per 5 seconds
-MAX_RETRIES = 3  # Reduced retries
-RETRY_DELAY = 5  # Reduced initial retry delay
+MAX_CONCURRENT_REQUESTS = 3  # Increased from 2 to 3 for more concurrent API calls
+REQUEST_DELAY = 3.0  # Reduced from 5.0 to 3.0 seconds between requests
+ETHERSCAN_RATE_LIMIT = 0.33  # Increased to allow ~3 requests per 10 seconds (within Etherscan's limits)
+MAX_RETRIES = 3  # Keep retries at 3
+RETRY_DELAY = 5  # Keep initial retry delay at 5 seconds
+QUICK_MODE_THRESHOLD = 2000  # Increased from 1000 to 2000 transactions in quick mode
+GAS_PERCENTILE_THRESHOLD = 95  # Keep gas threshold at 95th percentile
 
 def to_checksum_address(address: str) -> str:
     """Convert address to checksum format"""
@@ -663,24 +665,18 @@ class WalletTracker:
                 logger.error(f"Error analyzing transaction sequence: {e}")
                 return []
 
-    async def generate_enhanced_report_async(self, hours: int = 24) -> str:
-        """Generate an enhanced report asynchronously with optimized processing"""
-        logger.info(f"\nStarting analysis for the last {hours} hours...")
+    async def generate_enhanced_report_async(self, hours: int = 1, quick_mode: bool = False) -> str:
+        """Generate an enhanced report with optional quick mode for faster analysis"""
+        logger.info(f"\nStarting analysis for the last {hours} hours (Quick Mode: {quick_mode})...")
         
-        # Fetch token transfers sequentially with exponential backoff
+        # Fetch token transfers
         token_transfers = []
         for token_type in ['CHEX', 'DOGE']:
-            for attempt in range(MAX_RETRIES):
-                try:
-                    await asyncio.sleep(REQUEST_DELAY * (2 ** attempt))  # Exponential backoff
-                    transfers = await self.get_token_transfers_async(token_type, hours)
-                    token_transfers.append(transfers)
-                    break
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed for {token_type}: {e}")
-                    if attempt == MAX_RETRIES - 1:
-                        logger.error(f"Failed to fetch {token_type} transfers after {MAX_RETRIES} attempts")
-                        token_transfers.append([])
+            transfers = await self.get_token_transfers_async(token_type, hours)
+            if quick_mode and len(transfers) > QUICK_MODE_THRESHOLD:
+                logger.info(f"Quick mode: limiting {token_type} analysis to {QUICK_MODE_THRESHOLD} transfers")
+                transfers = transfers[:QUICK_MODE_THRESHOLD]
+            token_transfers.append(transfers)
         
         chex_moves, doge_moves = token_transfers
         total_transfers = len(chex_moves) + len(doge_moves)
@@ -695,7 +691,7 @@ class WalletTracker:
         
         logger.info(f"Unique addresses to analyze: {len(analyzed_addresses)}")
         
-        # Process addresses in chunks
+        # Process addresses in parallel
         address_chunks = [
             list(chunk)
             for chunk in self._chunks(analyzed_addresses, CHUNK_SIZE)
@@ -704,130 +700,54 @@ class WalletTracker:
         detailed_analysis = []
         total_chunks = len(address_chunks)
         
-        for chunk_idx, chunk in enumerate(address_chunks, 1):
-            logger.info(f"\nProcessing address chunk {chunk_idx}/{total_chunks} ({len(chunk)} addresses)")
-            # Analyze addresses in chunk concurrently
-            chunk_tasks = [
-                self.analyze_wallet_movement_async(address, hours)
-                for address in chunk
-            ]
-            chunk_results = await asyncio.gather(*chunk_tasks)
-            valid_results = [r for r in chunk_results if r]
-            detailed_analysis.extend(valid_results)
-            logger.info(f"Completed chunk {chunk_idx}/{total_chunks} - Found {len(valid_results)} valid results")
+        # Process chunks in parallel with asyncio.gather
+        for chunk_start in range(0, len(address_chunks), MAX_WORKERS):
+            chunk_batch = address_chunks[chunk_start:chunk_start + MAX_WORKERS]
+            logger.info(f"\nProcessing chunks {chunk_start + 1}-{chunk_start + len(chunk_batch)}/{total_chunks}")
             
-            # Add small delay between chunks to prevent rate limiting
+            chunk_tasks = []
+            for chunk in chunk_batch:
+                tasks = [self.analyze_wallet_movement_async(address, hours) for address in chunk]
+                chunk_tasks.extend(tasks)
+            
+            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+            valid_results = [r for r in chunk_results if r and not isinstance(r, Exception)]
+            detailed_analysis.extend(valid_results)
+            
+            logger.info(f"Completed batch - Found {len(valid_results)} valid results")
             await asyncio.sleep(REQUEST_DELAY)
         
         logger.info(f"\nCompleted analysis of {len(detailed_analysis)} wallets")
         
-        # Generate report
-        report = f"Enhanced Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        # Generate simplified report
+        report = f"Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report += f"Analysis Period: Last {hours} hours\n"
+        report += f"Analysis Mode: {'Quick' if quick_mode else 'Full'}\n\n"
         
-        # Top 10 Inflows
-        report += "=== Top 10 Inflows (Last 24h) ===\n\n"
-        inflows = sorted(detailed_analysis, key=lambda x: x['total_incoming'], reverse=True)[:10]
-        for idx, flow in enumerate(inflows, 1):
-            report += f"{idx}. Address: {flow['address']}\n"
-            report += f"   Amount: {flow['total_incoming']:,.2f}\n"
-            report += f"   Cluster Type: {flow['cluster_type']}\n"
-            report += f"   Transaction Count: {flow['transaction_count']}\n\n"
-        
-        # Top 10 Outflows
-        report += "=== Top 10 Outflows (Last 24h) ===\n\n"
-        outflows = sorted(detailed_analysis, key=lambda x: x['total_outgoing'], reverse=True)[:10]
-        for idx, flow in enumerate(outflows, 1):
-            report += f"{idx}. Address: {flow['address']}\n"
-            report += f"   Amount: {flow['total_outgoing']:,.2f}\n"
-            report += f"   Cluster Type: {flow['cluster_type']}\n"
-            report += f"   Transaction Count: {flow['transaction_count']}\n\n"
-        
-        # Top 10 Wallet Clusters Analysis
-        report += "=== Top 10 Most Active Wallet Clusters ===\n\n"
-        # Sort by total volume (in + out)
-        active_wallets = sorted(
-            detailed_analysis,
-            key=lambda x: x['total_incoming'] + x['total_outgoing'],
-            reverse=True
-        )[:10]
-        
-        for idx, wallet in enumerate(active_wallets, 1):
-            total_volume = wallet['total_incoming'] + wallet['total_outgoing']
-            net_flow = wallet['total_incoming'] - wallet['total_outgoing']
-            report += f"{idx}. Cluster: {wallet['cluster_type']}\n"
-            report += f"   Address: {wallet['address']}\n"
-            report += f"   Total Volume: {total_volume:,.2f}\n"
-            report += f"   Net Flow: {net_flow:,.2f}\n"
-            report += f"   Transaction Count: {wallet['transaction_count']}\n"
-            report += f"   Gas Spent: {wallet['total_gas_spent']:.4f} ETH\n\n"
-        
-        # Gas Analysis
-        report += "=== Gas Cost Analysis ===\n\n"
-        
-        # Calculate gas statistics
-        all_gas_prices = []
-        all_gas_used = []
-        for analysis in detailed_analysis:
-            for tx in analysis.get('transaction_sequence', []):
-                all_gas_prices.append(tx['gas_price'])
-                all_gas_used.append(tx['gas_used'])
-        
-        if all_gas_prices and all_gas_used:
-            avg_gas_price = sum(all_gas_prices) / len(all_gas_prices)
-            avg_gas_used = sum(all_gas_used) / len(all_gas_used)
-            max_gas_price = max(all_gas_prices)
-            min_gas_price = min(all_gas_prices)
+        # Top Movers (simplified)
+        if detailed_analysis:
+            report += "=== Top Movers ===\n"
+            sorted_by_volume = sorted(
+                detailed_analysis,
+                key=lambda x: x.get('total_volume', 0),
+                reverse=True
+            )
             
-            # Calculate percentiles for gas prices
-            gas_prices_gwei = [from_wei(price, 'gwei') for price in all_gas_prices]
-            percentiles = {
-                '90th': pd.Series(gas_prices_gwei).quantile(0.9),
-                '75th': pd.Series(gas_prices_gwei).quantile(0.75),
-                '50th': pd.Series(gas_prices_gwei).quantile(0.5),
-                '25th': pd.Series(gas_prices_gwei).quantile(0.25)
-            }
-            
-            report += f"Average Gas Price: {from_wei(avg_gas_price, 'gwei'):.2f} gwei\n"
-            report += f"Maximum Gas Price: {from_wei(max_gas_price, 'gwei'):.2f} gwei\n"
-            report += f"Minimum Gas Price: {from_wei(min_gas_price, 'gwei'):.2f} gwei\n"
-            report += f"Average Gas Used: {avg_gas_used:,.0f}\n\n"
-            
-            report += "Gas Price Percentiles (gwei):\n"
-            for percentile, value in percentiles.items():
-                report += f"{percentile}: {value:.2f}\n"
-            
-            # High Gas Cost Transactions
-            report += "\nHigh Gas Cost Transactions (>90th percentile):\n"
-            high_gas_txs = []
-            for analysis in detailed_analysis:
-                for tx in analysis.get('transaction_sequence', []):
-                    gas_cost_gwei = from_wei(tx['gas_price'], 'gwei')
-                    if gas_cost_gwei > percentiles['90th']:
-                        high_gas_txs.append({
-                            'address': analysis['address'],
-                            'timestamp': tx['timestamp'],
-                            'gas_price': gas_cost_gwei,
-                            'gas_used': tx['gas_used']
-                        })
-            
-            high_gas_txs.sort(key=lambda x: x['gas_price'], reverse=True)
-            for idx, tx in enumerate(high_gas_txs[:5], 1):
-                report += f"\n{idx}. Address: {tx['address']}\n"
-                report += f"   Time: {tx['timestamp']}\n"
-                report += f"   Gas Price: {tx['gas_price']:.2f} gwei\n"
-                report += f"   Gas Used: {tx['gas_used']:,}\n"
+            for idx, analysis in enumerate(sorted_by_volume[:5], 1):
+                report += f"\n{idx}. Address: {analysis['address']}\n"
+                report += f"   Volume: ${analysis.get('total_volume', 0):,.2f}\n"
+                report += f"   Transactions: {len(analysis.get('transaction_sequence', []))}\n"
         
-        # Unusual Patterns Section
-        report += "\n=== Unusual Activity Patterns ===\n"
-        for analysis in detailed_analysis:
-            if analysis['unusual_patterns']:
+        # Unusual Activity (simplified)
+        unusual_activity = [a for a in detailed_analysis if a.get('unusual_patterns')]
+        if unusual_activity:
+            report += "\n=== Unusual Activity ===\n"
+            for analysis in unusual_activity[:5]:  # Limit to top 5 for brevity
                 report += f"\nAddress: {analysis['address']}\n"
-                for pattern in analysis['unusual_patterns']:
-                    report += f"- {pattern['type']} detected at {pattern['timestamp']}\n"
-                    if 'gas_price' in pattern:
-                        report += f"  Gas Price: {from_wei(pattern['gas_price'], 'gwei')} gwei\n"
-                    if 'time_difference' in pattern:
-                        report += f"  Time between transactions: {pattern['time_difference']:.1f} seconds\n"
+                patterns = analysis.get('unusual_patterns', [])
+                report += f"Patterns detected: {len(patterns)}\n"
+                for pattern in patterns[:3]:  # Show only first 3 patterns
+                    report += f"- {pattern['type']} at {pattern['timestamp']}\n"
         
         return report
 
@@ -862,38 +782,37 @@ class WalletTracker:
             json.dump(self.balance_history, f, indent=2)
 
     def detect_unusual_gas_patterns(self, transactions):
-        """Detect unusual gas usage patterns that might indicate arbitrage or malicious activity"""
+        """Simplified detection of unusual gas patterns"""
         if not transactions:
             return []
         
-        # Calculate gas statistics
-        gas_prices = [tx['gas_price'] for tx in transactions]
-        avg_gas = sum(gas_prices) / len(gas_prices)
-        std_gas = pd.Series(gas_prices).std()
+        # Sort by gas price for quick percentile calculation
+        sorted_gas = sorted([tx['gas_price'] for tx in transactions])
+        high_gas_threshold = sorted_gas[int(len(sorted_gas) * GAS_PERCENTILE_THRESHOLD / 100)]
         
         unusual_patterns = []
+        last_tx_time = None
         
-        for i, tx in enumerate(transactions):
-            # Check for gas price spikes
-            if tx['gas_price'] > avg_gas + (2 * std_gas):
+        for tx in transactions:
+            current_time = tx['timestamp']
+            
+            # Check for high gas price (above 95th percentile)
+            if tx['gas_price'] > high_gas_threshold:
                 unusual_patterns.append({
                     'type': 'High Gas Price',
-                    'timestamp': tx['timestamp'],
-                    'gas_price': tx['gas_price'],
-                    'average_gas': avg_gas,
-                    'deviation': (tx['gas_price'] - avg_gas) / std_gas
+                    'timestamp': current_time,
+                    'gas_price': tx['gas_price']
                 })
             
-            # Check for rapid successive transactions
-            if i > 0:
-                time_diff = (transactions[i-1]['timestamp'] - tx['timestamp']).total_seconds()
-                if time_diff < 60 and tx['gas_price'] > avg_gas:  # Within 1 minute with above-average gas
-                    unusual_patterns.append({
-                        'type': 'Rapid Transactions',
-                        'timestamp': tx['timestamp'],
-                        'time_difference': time_diff,
-                        'gas_price': tx['gas_price']
-                    })
+            # Check for rapid transactions (within 30 seconds)
+            if last_tx_time and (last_tx_time - current_time).total_seconds() < 30:
+                unusual_patterns.append({
+                    'type': 'Rapid Transactions',
+                    'timestamp': current_time,
+                    'time_difference': (last_tx_time - current_time).total_seconds()
+                })
+            
+            last_tx_time = current_time
         
         return unusual_patterns
 
@@ -902,8 +821,11 @@ async def main():
     try:
         tracker = WalletTracker()
         
-        # Generate enhanced report with 2-hour time window for faster results
-        report = await tracker.generate_enhanced_report_async(hours=2)  # Reduced from 4 to 2 hours
+        # Generate report with quick mode for faster results
+        report = await tracker.generate_enhanced_report_async(
+            hours=1,  # Analyze last 1 hour of transactions
+            quick_mode=True  # Enable quick mode by default
+        )
         
         # Print report to console
         print("\nFinal Report:")
