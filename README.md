@@ -1,12 +1,11 @@
 # Large Wallet Movement Aggregator
 
-This tool tracks large wallet movements for CHEX (ERC-20), DOGE (Wrapped), and AAVE cryptocurrencies, generating daily reports of significant transfers. It helps monitor whale movements, exchange activities, and unusual transaction patterns across these tokens.
+This tool tracks large wallet movements for CHEX (ERC-20) and DOGE (Wrapped) cryptocurrencies, generating daily reports of significant transfers. It helps monitor whale movements, exchange activities, and unusual transaction patterns across these tokens.
 
 ## Features
 
 - Tracks CHEX token transfers using Etherscan API
 - Tracks DOGE (Wrapped) token transfers using Etherscan API
-- Tracks AAVE token transfers using Etherscan API
 - Identifies wallet clusters (exchanges, smart contracts, etc.)
 - Detects unusual gas patterns and rapid transactions
 - Analyzes transaction sequences for patterns
@@ -58,7 +57,6 @@ The script will:
 3. Filter for large movements (default thresholds):
    - 10,000+ CHEX
    - 50,000+ DOGE
-   - 100+ AAVE
 4. Generate a report with statistics and top movements
 5. Save the report to a dated file (e.g., `report_20240315.txt`)
 

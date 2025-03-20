@@ -23,14 +23,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants for optimization
-CHUNK_SIZE = 25  # Reduced chunk size for better rate limiting
-MAX_WORKERS = 5  # Reduced worker count
+CHUNK_SIZE = 5  # Very small chunk size for strict rate limiting
+MAX_WORKERS = 1  # Single worker to prevent concurrent requests
 CACHE_TTL = 3600  # Cache TTL in seconds
-MAX_CONCURRENT_REQUESTS = 2  # Reduced concurrent requests
-REQUEST_DELAY = 1.0  # Increased delay between requests
-ETHERSCAN_RATE_LIMIT = 3  # Reduced requests per second for Etherscan
-MAX_RETRIES = 5  # Increased maximum number of retries
-RETRY_DELAY = 2  # Increased initial retry delay
+MAX_CONCURRENT_REQUESTS = 1  # Single concurrent request
+REQUEST_DELAY = 5.0  # 5 second delay between requests
+ETHERSCAN_RATE_LIMIT = 0.2  # One request per 5 seconds
+MAX_RETRIES = 3  # Reduced retries to avoid long waits
+RETRY_DELAY = 10  # 10 second initial retry delay
 
 def to_checksum_address(address: str) -> str:
     """Convert address to checksum format"""
@@ -186,7 +186,6 @@ class WalletTracker:
             raise ConnectionError("Failed to connect to Ethereum network")
         
         self.chex_contract = '0x9Ce84F6A69986a83d92C324df10bC8E64771030f'
-        self.aave_contract = '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'
         self.doge_contract = '0x4206931337dc273a630d328dA6441786BfaD668f'
         
         # Enhanced caching system
@@ -247,17 +246,6 @@ class WalletTracker:
                 'Binance': '0x28C6c06298d514Db089934071355E5743bf21d60',
                 'Bitfinex': '0x77134cbC06cB00b66F4c7e623D5fdBF6777635EC',
                 'Kraken': '0x2B5634C42055806a59e9107ED44D43c426E58258',
-                'Binance Hot Wallet': '0x8894E0a0c962CB723c1976a4421c95949bE2D4E3',
-                'Crypto.com': '0x6262998Ced04146fA42253a5C0AF90CA02dfd2A3'
-            }.items()
-        }
-        
-        self.aave_addresses = {
-            name: to_checksum_address(addr)
-            for name, addr in {
-                'Binance': '0x28C6c06298d514Db089934071355E5743bf21d60',
-                'Aave Treasury': '0x25F2226B597E8F9514B3F68F00f494cF4f286491',
-                'Aave Collector': '0x464C71f6c2F760DdA6093dCB91C24c39e5d6e18c',
                 'Binance Hot Wallet': '0x8894E0a0c962CB723c1976a4421c95949bE2D4E3',
                 'Crypto.com': '0x6262998Ced04146fA42253a5C0AF90CA02dfd2A3'
             }.items()
@@ -461,7 +449,6 @@ class WalletTracker:
         
         contract_address = {
             'CHEX': self.chex_contract,
-            'AAVE': self.aave_contract,
             'DOGE': self.doge_contract
         }.get(token_type)
         
@@ -516,8 +503,7 @@ class WalletTracker:
         """Fetch token balances asynchronously with batch processing"""
         balances = {}
         contract_address = {
-            'DOGE': self.doge_contract,
-            'AAVE': self.aave_contract
+            'DOGE': self.doge_contract
         }.get(token_type)
         
         if not contract_address:
@@ -676,18 +662,26 @@ class WalletTracker:
 
     async def generate_enhanced_report_async(self, hours: int = 24) -> str:
         """Generate an enhanced report asynchronously with optimized processing"""
-        # Fetch token transfers concurrently with chunking
-        token_transfers = await asyncio.gather(
-            self.get_token_transfers_async('CHEX', hours),
-            self.get_token_transfers_async('DOGE', hours),
-            self.get_token_transfers_async('AAVE', hours)
-        )
+        # Fetch token transfers sequentially with exponential backoff
+        token_transfers = []
+        for token_type in ['CHEX', 'DOGE']:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    await asyncio.sleep(REQUEST_DELAY * (2 ** attempt))  # Exponential backoff
+                    transfers = await self.get_token_transfers_async(token_type, hours)
+                    token_transfers.append(transfers)
+                    break
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed for {token_type}: {e}")
+                    if attempt == MAX_RETRIES - 1:
+                        logger.error(f"Failed to fetch {token_type} transfers after {MAX_RETRIES} attempts")
+                        token_transfers.append([])
         
-        chex_moves, doge_moves, aave_moves = token_transfers
+        chex_moves, doge_moves = token_transfers
         
         # Collect unique addresses
         analyzed_addresses = set()
-        for moves in [chex_moves, doge_moves, aave_moves]:
+        for moves in [chex_moves, doge_moves]:
             for tx in moves:
                 analyzed_addresses.add(tx['from'])
                 analyzed_addresses.add(tx['to'])
@@ -892,8 +886,8 @@ async def main():
     try:
         tracker = WalletTracker()
         
-        # Generate enhanced report
-        report = await tracker.generate_enhanced_report_async()
+        # Generate enhanced report with 8 hour coverage
+        report = await tracker.generate_enhanced_report_async(hours=8)
         
         # Print report to console
         print("\nFinal Report:")

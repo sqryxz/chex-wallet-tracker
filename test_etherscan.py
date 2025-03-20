@@ -31,8 +31,7 @@ def test_etherscan_api():
     print("\nTest 2: Token Transfers")
     tokens = {
         'CHEX': '0x9Ce84F6A69986a83d92C324df10bC8E64771030f',
-        'DOGE': '0x4206931337dc273a630d328dA6441786BfaD668f',
-        'AAVE': '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'
+        'DOGE': '0x4206931337dc273a630d328dA6441786BfaD668f'
     }
     
     # Get transfers from last 24 hours
