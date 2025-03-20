@@ -57,15 +57,6 @@ def to_checksum_address(address: str) -> str:
     
     return ret
 
-def from_wei(value: int, unit: str = 'ether') -> float:
-    """Convert wei value to ether or gwei"""
-    if unit == 'ether':
-        return float(value) / 1e18
-    elif unit == 'gwei':
-        return float(value) / 1e9
-    else:
-        raise ValueError("Unsupported unit. Use 'ether' or 'gwei'")
-
 def to_wei(value: float, unit: str = 'ether') -> int:
     """Convert ether or gwei value to wei"""
     if unit == 'ether':
@@ -444,7 +435,8 @@ class WalletTracker:
         
         endpoint = 'https://api.etherscan.io/api'
         
-        current_time = datetime.now()
+        # Calculate start time in UTC to match Etherscan's timestamps
+        current_time = datetime.utcnow()
         start_time = int((current_time - timedelta(hours=hours)).timestamp())
         
         contract_address = {
@@ -480,9 +472,14 @@ class WalletTracker:
                             data = await response.json()
                             if data['status'] == '1':
                                 result = data['result']
-                                logger.info(f"Successfully fetched {len(result)} {token_type} transfers")
-                                self._transfer_cache.set(cache_key, result)
-                                return result
+                                # Filter transactions by timestamp
+                                filtered_result = [
+                                    tx for tx in result 
+                                    if int(tx['timeStamp']) >= start_time
+                                ]
+                                logger.info(f"Successfully fetched {len(filtered_result)} {token_type} transfers")
+                                self._transfer_cache.set(cache_key, filtered_result)
+                                return filtered_result
                             elif 'Max rate limit reached' in str(data.get('result', '')):
                                 logger.warning(f"Rate limit hit for {token_type}, attempt {attempt + 1}/{max_retries}")
                                 await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
@@ -751,13 +748,21 @@ class WalletTracker:
         if df.empty:
             return {}
         
+        # Calculate time-based metrics using the full timestamp
+        current_time = pd.Timestamp.now()
+        df['minutes_ago'] = (current_time - df['timestamp']).dt.total_seconds() / 60
+        df['time_window'] = df['minutes_ago'].apply(lambda x: f"{int(x/15)*15}-{int(x/15)*15 + 15}")
+        
+        # Convert gas costs from wei to gwei (1 gwei = 10^9 wei)
+        gas_costs_gwei = df['gas_cost'] / 1e9
+        
         analysis = {
-            'hourly_volume': df.groupby('hour')['amount'].sum().to_dict(),
+            'time_windows': df.groupby('time_window')['amount'].sum().sort_values(ascending=False).head(5).to_dict(),
             'daily_patterns': df.groupby('day_of_week')['amount'].agg(['count', 'sum', 'mean']).to_dict(),
             'gas_statistics': {
-                'mean': float(df['gas_cost'].mean()),
-                'median': float(df['gas_cost'].median()),
-                'std': float(df['gas_cost'].std())
+                'mean': float(gas_costs_gwei.mean()),
+                'median': float(gas_costs_gwei.median()),
+                'std': float(gas_costs_gwei.std())
             }
         }
         
@@ -874,15 +879,15 @@ Analysis Mode: {'Quick' if quick_mode else 'Full'}\n"""
                     for percentile, value in patterns['amount_percentiles'].items():
                         report += f"{percentile} percentile: {value:,.2f} {token}\n"
                     
-                    # Add hourly activity
-                    report += "\nHourly Activity (Top 5):\n"
-                    for hour, volume in patterns['hourly_volume'].items():
-                        report += f"Hour {hour:02d}:00 - {volume:,.2f} {token}\n"
+                    # Add activity by 15-minute windows
+                    report += "\nActivity by 15-minute Windows:\n"
+                    for window, volume in patterns['time_windows'].items():
+                        report += f"Minutes ago {window}: {volume:,.2f} {token}\n"
                     
                     # Add gas statistics
                     report += "\nGas Usage Statistics:\n"
                     for stat, value in patterns['gas_statistics'].items():
-                        report += f"{stat}: {value:,.2f} wei\n"
+                        report += f"{stat}: {value:,.2f} gwei\n"
                     
                     # Add network metrics
                     report += "\nNetwork Analysis:\n"
