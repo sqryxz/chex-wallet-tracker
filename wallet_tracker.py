@@ -23,14 +23,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Constants for optimization
-CHUNK_SIZE = 5  # Very small chunk size for strict rate limiting
-MAX_WORKERS = 1  # Single worker to prevent concurrent requests
+CHUNK_SIZE = 2  # Reduced chunk size for faster processing
+MAX_WORKERS = 2  # Increased workers for parallel processing
 CACHE_TTL = 3600  # Cache TTL in seconds
-MAX_CONCURRENT_REQUESTS = 1  # Single concurrent request
-REQUEST_DELAY = 5.0  # 5 second delay between requests
-ETHERSCAN_RATE_LIMIT = 0.2  # One request per 5 seconds
-MAX_RETRIES = 3  # Reduced retries to avoid long waits
-RETRY_DELAY = 10  # 10 second initial retry delay
+MAX_CONCURRENT_REQUESTS = 2  # Increased concurrent requests
+REQUEST_DELAY = 5.0  # Reduced delay between requests
+ETHERSCAN_RATE_LIMIT = 0.2  # Increased rate to 1 request per 5 seconds
+MAX_RETRIES = 3  # Reduced retries
+RETRY_DELAY = 5  # Reduced initial retry delay
 
 def to_checksum_address(address: str) -> str:
     """Convert address to checksum format"""
@@ -171,17 +171,14 @@ class WalletTracker:
         load_dotenv()
         
         self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
-        self.infura_api_key = os.getenv('INFURA_API_KEY')
         
         if not self.etherscan_api_key:
             raise ValueError("Etherscan API key not found in .env file")
-        if not self.infura_api_key:
-            raise ValueError("Infura API key not found in .env file")
             
         logger.info("Initializing WalletTracker with Etherscan API...")
         
-        # Initialize Web3
-        self.w3 = Web3(Web3.HTTPProvider(f'https://mainnet.infura.io/v3/{self.infura_api_key}'))
+        # Initialize Web3 with public endpoint
+        self.w3 = Web3(Web3.HTTPProvider('https://cloudflare-eth.com'))
         if not self.w3.is_connected():
             raise ConnectionError("Failed to connect to Ethereum network")
         
@@ -440,6 +437,7 @@ class WalletTracker:
         cache_key = f"{token_type}_{hours}"
         cached_result = self._transfer_cache.get(cache_key)
         if cached_result:
+            logger.info(f"Found {len(cached_result)} cached {token_type} transfers")
             return cached_result
         
         endpoint = 'https://api.etherscan.io/api'
@@ -480,6 +478,7 @@ class WalletTracker:
                             data = await response.json()
                             if data['status'] == '1':
                                 result = data['result']
+                                logger.info(f"Successfully fetched {len(result)} {token_type} transfers")
                                 self._transfer_cache.set(cache_key, result)
                                 return result
                             elif 'Max rate limit reached' in str(data.get('result', '')):
@@ -635,6 +634,7 @@ class WalletTracker:
                         return []
                     
                     transactions = data['result']
+                    logger.info(f"Analyzing {len(transactions)} transactions for address {address[:8]}...")
                     
                     # Process transactions
                     timeline = []
@@ -655,6 +655,9 @@ class WalletTracker:
                             'gas_used': int(tx['gasUsed'])
                         })
                     
+                    if len(timeline) > 0:
+                        logger.info(f"Found {len(timeline)} relevant transactions for address {address[:8]}")
+                    
                     return timeline
             except Exception as e:
                 logger.error(f"Error analyzing transaction sequence: {e}")
@@ -662,6 +665,8 @@ class WalletTracker:
 
     async def generate_enhanced_report_async(self, hours: int = 24) -> str:
         """Generate an enhanced report asynchronously with optimized processing"""
+        logger.info(f"\nStarting analysis for the last {hours} hours...")
+        
         # Fetch token transfers sequentially with exponential backoff
         token_transfers = []
         for token_type in ['CHEX', 'DOGE']:
@@ -678,6 +683,8 @@ class WalletTracker:
                         token_transfers.append([])
         
         chex_moves, doge_moves = token_transfers
+        total_transfers = len(chex_moves) + len(doge_moves)
+        logger.info(f"\nTotal transfers to analyze: {total_transfers} ({len(chex_moves)} CHEX, {len(doge_moves)} DOGE)")
         
         # Collect unique addresses
         analyzed_addresses = set()
@@ -686,6 +693,8 @@ class WalletTracker:
                 analyzed_addresses.add(tx['from'])
                 analyzed_addresses.add(tx['to'])
         
+        logger.info(f"Unique addresses to analyze: {len(analyzed_addresses)}")
+        
         # Process addresses in chunks
         address_chunks = [
             list(chunk)
@@ -693,17 +702,24 @@ class WalletTracker:
         ]
         
         detailed_analysis = []
-        for chunk in address_chunks:
+        total_chunks = len(address_chunks)
+        
+        for chunk_idx, chunk in enumerate(address_chunks, 1):
+            logger.info(f"\nProcessing address chunk {chunk_idx}/{total_chunks} ({len(chunk)} addresses)")
             # Analyze addresses in chunk concurrently
             chunk_tasks = [
                 self.analyze_wallet_movement_async(address, hours)
                 for address in chunk
             ]
             chunk_results = await asyncio.gather(*chunk_tasks)
-            detailed_analysis.extend([r for r in chunk_results if r])
+            valid_results = [r for r in chunk_results if r]
+            detailed_analysis.extend(valid_results)
+            logger.info(f"Completed chunk {chunk_idx}/{total_chunks} - Found {len(valid_results)} valid results")
             
             # Add small delay between chunks to prevent rate limiting
             await asyncio.sleep(REQUEST_DELAY)
+        
+        logger.info(f"\nCompleted analysis of {len(detailed_analysis)} wallets")
         
         # Generate report
         report = f"Enhanced Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -886,8 +902,8 @@ async def main():
     try:
         tracker = WalletTracker()
         
-        # Generate enhanced report with 8 hour coverage
-        report = await tracker.generate_enhanced_report_async(hours=8)
+        # Generate enhanced report with 2-hour time window for faster results
+        report = await tracker.generate_enhanced_report_async(hours=2)  # Reduced from 4 to 2 hours
         
         # Print report to console
         print("\nFinal Report:")
