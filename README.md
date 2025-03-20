@@ -18,7 +18,6 @@ This tool tracks large wallet movements for CHEX (ERC-20), DOGE (Wrapped), and A
 ## Requirements
 
 - Python 3.8+
-- Ethereum node access (via Infura)
 - Etherscan API key
 - Required Python packages (see requirements.txt)
 
@@ -40,13 +39,11 @@ This tool tracks large wallet movements for CHEX (ERC-20), DOGE (Wrapped), and A
    cp .env.example .env
    ```
 
-4. Edit `.env` and add your API keys:
+4. Edit `.env` and add your API key:
    ```
    ETHERSCAN_API_KEY=your_etherscan_key_here
-   INFURA_API_KEY=your_infura_key_here
    ```
    - Get an Etherscan API key from https://etherscan.io/apis
-   - Get an Infura API key from https://infura.io
 
 ## Usage
 
@@ -56,7 +53,7 @@ python3 wallet_tracker.py
 ```
 
 The script will:
-1. Connect to Ethereum network via Infura
+1. Connect to Etherscan API
 2. Fetch the last 24 hours of transactions
 3. Filter for large movements (default thresholds):
    - 10,000+ CHEX
