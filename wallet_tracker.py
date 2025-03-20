@@ -16,20 +16,21 @@ import logging
 from dataclasses import dataclass, field
 from itertools import islice
 import math
+from web3 import Web3
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Constants for optimization
-CHUNK_SIZE = 50  # Reduced chunk size for better rate limiting
-MAX_WORKERS = 10  # Reduced worker count
+CHUNK_SIZE = 25  # Reduced chunk size for better rate limiting
+MAX_WORKERS = 5  # Reduced worker count
 CACHE_TTL = 3600  # Cache TTL in seconds
-MAX_CONCURRENT_REQUESTS = 3  # Reduced concurrent requests
-REQUEST_DELAY = 0.5  # Increased delay between requests
-ETHERSCAN_RATE_LIMIT = 5  # Requests per second for Etherscan
-MAX_RETRIES = 3  # Maximum number of retries for failed requests
-RETRY_DELAY = 1  # Initial retry delay in seconds
+MAX_CONCURRENT_REQUESTS = 2  # Reduced concurrent requests
+REQUEST_DELAY = 1.0  # Increased delay between requests
+ETHERSCAN_RATE_LIMIT = 3  # Reduced requests per second for Etherscan
+MAX_RETRIES = 5  # Increased maximum number of retries
+RETRY_DELAY = 2  # Increased initial retry delay
 
 def to_checksum_address(address: str) -> str:
     """Convert address to checksum format"""
@@ -170,11 +171,19 @@ class WalletTracker:
         load_dotenv()
         
         self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY')
+        self.infura_api_key = os.getenv('INFURA_API_KEY')
         
         if not self.etherscan_api_key:
             raise ValueError("Etherscan API key not found in .env file")
+        if not self.infura_api_key:
+            raise ValueError("Infura API key not found in .env file")
             
         logger.info("Initializing WalletTracker with Etherscan API...")
+        
+        # Initialize Web3
+        self.w3 = Web3(Web3.HTTPProvider(f'https://mainnet.infura.io/v3/{self.infura_api_key}'))
+        if not self.w3.is_connected():
+            raise ConnectionError("Failed to connect to Ethereum network")
         
         self.chex_contract = '0x9Ce84F6A69986a83d92C324df10bC8E64771030f'
         self.aave_contract = '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9'
@@ -340,11 +349,19 @@ class WalletTracker:
             'apikey': self.etherscan_api_key
         }
         
-        async with self.session.get(endpoint, params=params) as response:
-            data = await response.json()
-            if data['status'] == '1':
-                return data['result']
-            return ''  # Return empty string if no contract code found
+        try:
+            async with self.session.get(endpoint, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('status') == '1' and data.get('result'):
+                        return data['result']
+                    elif 'Max rate limit reached' in str(data.get('result', '')):
+                        await asyncio.sleep(1)  # Wait before retry
+                        return ''
+                return ''
+        except Exception as e:
+            logger.error(f"Error getting contract code for {address}: {str(e)}")
+            return ''
 
     async def get_transaction_count(self, address: str) -> int:
         """Get transaction count using Etherscan API"""
@@ -357,10 +374,18 @@ class WalletTracker:
             'apikey': self.etherscan_api_key
         }
         
-        async with self.session.get(endpoint, params=params) as response:
-            data = await response.json()
-            if data['status'] == '1':
-                return int(data['result'], 16)
+        try:
+            async with self.session.get(endpoint, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('result'):
+                        return int(data['result'], 16)
+                    elif 'Max rate limit reached' in str(data.get('result', '')):
+                        await asyncio.sleep(1)  # Wait before retry
+                        return 0
+                return 0
+        except Exception as e:
+            logger.error(f"Error getting transaction count for {address}: {str(e)}")
             return 0
 
     async def get_token_balance(self, token_address: str, wallet_address: str) -> float:
@@ -393,6 +418,7 @@ class WalletTracker:
         
         async def process_request(req_type: str, address: str) -> Tuple[str, Any]:
             try:
+                await self.etherscan_limiter.acquire()
                 if req_type == 'code':
                     result = await self.get_contract_code(address)
                 elif req_type == 'txcount':
@@ -401,17 +427,25 @@ class WalletTracker:
                     result = None
                 return address, result
             except Exception as e:
-                logger.error(f"Error in batch API request: {e}")
+                logger.error(f"Error in batch API request for {address}: {str(e)}")
                 return address, None
         
-        tasks = [process_request(req_type, addr) for req_type, addr in batch]
-        results = await asyncio.gather(*tasks)
+        tasks = []
+        for req_type, addr in batch:
+            task = process_request(req_type, addr)
+            tasks.append(task)
+            # Add delay between requests to respect rate limit
+            await asyncio.sleep(0.2)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Update caches with results
-        for address, result in results:
-            if result is not None:
-                cache_key = f"{address}_{req_type}"
-                self._wallet_analysis_cache.set(cache_key, result)
+        for result in results:
+            if isinstance(result, tuple) and result[1] is not None:
+                address, data = result
+                cache_key = f"cluster_{address}"
+                if data:  # If we got valid data
+                    self._wallet_analysis_cache.set(cache_key, data)
 
     async def get_token_transfers_async(self, token_type: str, hours: int = 24) -> List[dict]:
         """Asynchronous token transfer fetching with enhanced caching and rate limiting"""
@@ -446,26 +480,37 @@ class WalletTracker:
         
         logger.info(f"Fetching {token_type} transfers since {datetime.fromtimestamp(start_time)}")
         
-        async with self.request_semaphore:
-            await self.etherscan_limiter.acquire()
-            
-            async def make_request():
-                async with self.session.get(endpoint, params=params, timeout=30) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data['status'] == '1':
-                            return data['result']
-                        elif 'Max rate limit reached' in str(data.get('result', '')):
-                            raise Exception("Rate limit reached")
-                    raise Exception(f"API error: {await response.text()}")
-            
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
             try:
-                result = await retry_with_backoff(make_request)
-                self._transfer_cache.set(cache_key, result)
-                return result
+                async with self.request_semaphore:
+                    await self.etherscan_limiter.acquire()
+                    
+                    async with self.session.get(endpoint, params=params, timeout=30) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data['status'] == '1':
+                                result = data['result']
+                                self._transfer_cache.set(cache_key, result)
+                                return result
+                            elif 'Max rate limit reached' in str(data.get('result', '')):
+                                logger.warning(f"Rate limit hit for {token_type}, attempt {attempt + 1}/{max_retries}")
+                                await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                                continue
+                        
+                        logger.error(f"API error for {token_type}: {await response.text()}")
+                        return []
+                        
             except Exception as e:
                 logger.error(f"Error fetching {token_type} transfers: {e}")
-                return []
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                else:
+                    return []
+        
+        return []
 
     async def get_token_balances_async(self, token_type: str, addresses: Dict[str, str]) -> Dict[str, float]:
         """Fetch token balances asynchronously with batch processing"""
@@ -669,15 +714,98 @@ class WalletTracker:
         # Generate report
         report = f"Enhanced Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         
-        # Wallet Clustering Section
-        report += "=== Wallet Clustering Analysis ===\n"
+        # Top 10 Inflows
+        report += "=== Top 10 Inflows (Last 24h) ===\n\n"
+        inflows = sorted(detailed_analysis, key=lambda x: x['total_incoming'], reverse=True)[:10]
+        for idx, flow in enumerate(inflows, 1):
+            report += f"{idx}. Address: {flow['address']}\n"
+            report += f"   Amount: {flow['total_incoming']:,.2f}\n"
+            report += f"   Cluster Type: {flow['cluster_type']}\n"
+            report += f"   Transaction Count: {flow['transaction_count']}\n\n"
+        
+        # Top 10 Outflows
+        report += "=== Top 10 Outflows (Last 24h) ===\n\n"
+        outflows = sorted(detailed_analysis, key=lambda x: x['total_outgoing'], reverse=True)[:10]
+        for idx, flow in enumerate(outflows, 1):
+            report += f"{idx}. Address: {flow['address']}\n"
+            report += f"   Amount: {flow['total_outgoing']:,.2f}\n"
+            report += f"   Cluster Type: {flow['cluster_type']}\n"
+            report += f"   Transaction Count: {flow['transaction_count']}\n\n"
+        
+        # Top 10 Wallet Clusters Analysis
+        report += "=== Top 10 Most Active Wallet Clusters ===\n\n"
+        # Sort by total volume (in + out)
+        active_wallets = sorted(
+            detailed_analysis,
+            key=lambda x: x['total_incoming'] + x['total_outgoing'],
+            reverse=True
+        )[:10]
+        
+        for idx, wallet in enumerate(active_wallets, 1):
+            total_volume = wallet['total_incoming'] + wallet['total_outgoing']
+            net_flow = wallet['total_incoming'] - wallet['total_outgoing']
+            report += f"{idx}. Cluster: {wallet['cluster_type']}\n"
+            report += f"   Address: {wallet['address']}\n"
+            report += f"   Total Volume: {total_volume:,.2f}\n"
+            report += f"   Net Flow: {net_flow:,.2f}\n"
+            report += f"   Transaction Count: {wallet['transaction_count']}\n"
+            report += f"   Gas Spent: {wallet['total_gas_spent']:.4f} ETH\n\n"
+        
+        # Gas Analysis
+        report += "=== Gas Cost Analysis ===\n\n"
+        
+        # Calculate gas statistics
+        all_gas_prices = []
+        all_gas_used = []
         for analysis in detailed_analysis:
-            report += f"\nAddress: {analysis['address']}\n"
-            report += f"Cluster Type: {analysis['cluster_type']}\n"
-            report += f"Total Incoming: {analysis['total_incoming']:,.2f}\n"
-            report += f"Total Outgoing: {analysis['total_outgoing']:,.2f}\n"
-            report += f"Transaction Count: {analysis['transaction_count']}\n"
-            report += f"Total Gas Spent: {analysis['total_gas_spent']:.4f} ETH\n"
+            for tx in analysis.get('transaction_sequence', []):
+                all_gas_prices.append(tx['gas_price'])
+                all_gas_used.append(tx['gas_used'])
+        
+        if all_gas_prices and all_gas_used:
+            avg_gas_price = sum(all_gas_prices) / len(all_gas_prices)
+            avg_gas_used = sum(all_gas_used) / len(all_gas_used)
+            max_gas_price = max(all_gas_prices)
+            min_gas_price = min(all_gas_prices)
+            
+            # Calculate percentiles for gas prices
+            gas_prices_gwei = [from_wei(price, 'gwei') for price in all_gas_prices]
+            percentiles = {
+                '90th': pd.Series(gas_prices_gwei).quantile(0.9),
+                '75th': pd.Series(gas_prices_gwei).quantile(0.75),
+                '50th': pd.Series(gas_prices_gwei).quantile(0.5),
+                '25th': pd.Series(gas_prices_gwei).quantile(0.25)
+            }
+            
+            report += f"Average Gas Price: {from_wei(avg_gas_price, 'gwei'):.2f} gwei\n"
+            report += f"Maximum Gas Price: {from_wei(max_gas_price, 'gwei'):.2f} gwei\n"
+            report += f"Minimum Gas Price: {from_wei(min_gas_price, 'gwei'):.2f} gwei\n"
+            report += f"Average Gas Used: {avg_gas_used:,.0f}\n\n"
+            
+            report += "Gas Price Percentiles (gwei):\n"
+            for percentile, value in percentiles.items():
+                report += f"{percentile}: {value:.2f}\n"
+            
+            # High Gas Cost Transactions
+            report += "\nHigh Gas Cost Transactions (>90th percentile):\n"
+            high_gas_txs = []
+            for analysis in detailed_analysis:
+                for tx in analysis.get('transaction_sequence', []):
+                    gas_cost_gwei = from_wei(tx['gas_price'], 'gwei')
+                    if gas_cost_gwei > percentiles['90th']:
+                        high_gas_txs.append({
+                            'address': analysis['address'],
+                            'timestamp': tx['timestamp'],
+                            'gas_price': gas_cost_gwei,
+                            'gas_used': tx['gas_used']
+                        })
+            
+            high_gas_txs.sort(key=lambda x: x['gas_price'], reverse=True)
+            for idx, tx in enumerate(high_gas_txs[:5], 1):
+                report += f"\n{idx}. Address: {tx['address']}\n"
+                report += f"   Time: {tx['timestamp']}\n"
+                report += f"   Gas Price: {tx['gas_price']:.2f} gwei\n"
+                report += f"   Gas Used: {tx['gas_used']:,}\n"
         
         # Unusual Patterns Section
         report += "\n=== Unusual Activity Patterns ===\n"
