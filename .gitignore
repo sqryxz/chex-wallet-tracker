@@ -1,5 +1,9 @@
 # Environment variables
 .env
+.venv
+env/
+venv/
+ENV/
 
 # Python
 __pycache__/
@@ -38,3 +42,6 @@ xrp_balance_history.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Project specific
+token_balance_history.json

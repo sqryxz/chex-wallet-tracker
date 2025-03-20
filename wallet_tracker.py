@@ -665,122 +665,6 @@ class WalletTracker:
                 logger.error(f"Error analyzing transaction sequence: {e}")
                 return []
 
-    async def generate_enhanced_report_async(self, hours: int = 1, quick_mode: bool = False) -> str:
-        """Generate an enhanced report with optional quick mode for faster analysis"""
-        logger.info(f"\nStarting analysis for the last {hours} hours (Quick Mode: {quick_mode})...")
-        
-        # Fetch token transfers
-        token_transfers = []
-        for token_type in ['CHEX', 'DOGE']:
-            transfers = await self.get_token_transfers_async(token_type, hours)
-            if quick_mode and len(transfers) > QUICK_MODE_THRESHOLD:
-                logger.info(f"Quick mode: limiting {token_type} analysis to {QUICK_MODE_THRESHOLD} transfers")
-                transfers = transfers[:QUICK_MODE_THRESHOLD]
-            token_transfers.append(transfers)
-        
-        chex_moves, doge_moves = token_transfers
-        total_transfers = len(chex_moves) + len(doge_moves)
-        logger.info(f"\nTotal transfers to analyze: {total_transfers} ({len(chex_moves)} CHEX, {len(doge_moves)} DOGE)")
-        
-        # Collect unique addresses
-        analyzed_addresses = set()
-        for moves in [chex_moves, doge_moves]:
-            for tx in moves:
-                analyzed_addresses.add(tx['from'])
-                analyzed_addresses.add(tx['to'])
-        
-        logger.info(f"Unique addresses to analyze: {len(analyzed_addresses)}")
-        
-        # Process addresses in parallel
-        address_chunks = [
-            list(chunk)
-            for chunk in self._chunks(analyzed_addresses, CHUNK_SIZE)
-        ]
-        
-        detailed_analysis = []
-        total_chunks = len(address_chunks)
-        
-        # Process chunks in parallel with asyncio.gather
-        for chunk_start in range(0, len(address_chunks), MAX_WORKERS):
-            chunk_batch = address_chunks[chunk_start:chunk_start + MAX_WORKERS]
-            logger.info(f"\nProcessing chunks {chunk_start + 1}-{chunk_start + len(chunk_batch)}/{total_chunks}")
-            
-            chunk_tasks = []
-            for chunk in chunk_batch:
-                tasks = [self.analyze_wallet_movement_async(address, hours) for address in chunk]
-                chunk_tasks.extend(tasks)
-            
-            chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-            valid_results = [r for r in chunk_results if r and not isinstance(r, Exception)]
-            detailed_analysis.extend(valid_results)
-            
-            logger.info(f"Completed batch - Found {len(valid_results)} valid results")
-            await asyncio.sleep(REQUEST_DELAY)
-        
-        logger.info(f"\nCompleted analysis of {len(detailed_analysis)} wallets")
-        
-        # Generate simplified report
-        report = f"Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        report += f"Analysis Period: Last {hours} hours\n"
-        report += f"Analysis Mode: {'Quick' if quick_mode else 'Full'}\n\n"
-        
-        # Top Movers (simplified)
-        if detailed_analysis:
-            report += "=== Top Movers ===\n"
-            sorted_by_volume = sorted(
-                detailed_analysis,
-                key=lambda x: x.get('total_volume', 0),
-                reverse=True
-            )
-            
-            for idx, analysis in enumerate(sorted_by_volume[:5], 1):
-                report += f"\n{idx}. Address: {analysis['address']}\n"
-                report += f"   Volume: ${analysis.get('total_volume', 0):,.2f}\n"
-                report += f"   Transactions: {len(analysis.get('transaction_sequence', []))}\n"
-        
-        # Unusual Activity (simplified)
-        unusual_activity = [a for a in detailed_analysis if a.get('unusual_patterns')]
-        if unusual_activity:
-            report += "\n=== Unusual Activity ===\n"
-            for analysis in unusual_activity[:5]:  # Limit to top 5 for brevity
-                report += f"\nAddress: {analysis['address']}\n"
-                patterns = analysis.get('unusual_patterns', [])
-                report += f"Patterns detected: {len(patterns)}\n"
-                for pattern in patterns[:3]:  # Show only first 3 patterns
-                    report += f"- {pattern['type']} at {pattern['timestamp']}\n"
-        
-        return report
-
-    async def close(self):
-        """Clean up resources properly"""
-        try:
-            if hasattr(self, 'session') and not self.session.closed:
-                await self.session.close()
-                
-            if hasattr(self, 'thread_pool'):
-                self.thread_pool.shutdown(wait=True)
-                
-            # Wait for any remaining tasks
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}", exc_info=True)
-
-    def load_balance_history(self):
-        """Load historical balance data from file"""
-        try:
-            with open(self.balance_history_file, 'r') as f:
-                self.balance_history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.balance_history = {}
-            
-    def save_balance_history(self):
-        """Save historical balance data to file"""
-        with open(self.balance_history_file, 'w') as f:
-            json.dump(self.balance_history, f, indent=2)
-
     def detect_unusual_gas_patterns(self, transactions):
         """Simplified detection of unusual gas patterns"""
         if not transactions:
@@ -815,6 +699,257 @@ class WalletTracker:
             last_tx_time = current_time
         
         return unusual_patterns
+
+    def create_transaction_dataframe(self, transactions: List[dict]) -> pd.DataFrame:
+        """Convert transaction data to pandas DataFrame for analysis"""
+        if not transactions:
+            return pd.DataFrame()
+        
+        # Create DataFrame from raw transactions
+        df = pd.DataFrame(transactions)
+        
+        # Debug log for first few transactions
+        if len(transactions) > 0:
+            token_symbol = transactions[0].get('tokenSymbol', 'Unknown')
+            logger.info(f"\nAnalyzing {token_symbol} transactions:")
+            for i, tx in enumerate(transactions[:3]):
+                logger.info(f"Transaction {i + 1}:")
+                logger.info(f"  Value (wei): {tx.get('value', '0')}")
+                logger.info(f"  From: {tx.get('from', 'Unknown')}")
+                logger.info(f"  To: {tx.get('to', 'Unknown')}")
+                logger.info(f"  Token Decimals: {tx.get('tokenDecimal', '18')}")
+        
+        # Convert timeStamp to datetime
+        df['timestamp'] = pd.to_datetime(df['timeStamp'].astype(int), unit='s')
+        df['hour'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.day_name()
+        
+        # Convert value to numeric and from wei to ether using token decimals
+        def convert_to_token_amount(row):
+            value = int(row['value'])
+            decimals = int(row.get('tokenDecimal', 18))  # Default to 18 if not specified
+            return float(value) / (10 ** decimals)
+        
+        df['amount'] = df.apply(convert_to_token_amount, axis=1)
+        
+        # Convert gas values to numeric using string conversion for large numbers
+        df['gas_price'] = df['gasPrice'].apply(lambda x: int(x))
+        df['gas_used'] = df['gasUsed'].apply(lambda x: int(x))
+        df['gas_cost'] = df['gas_price'] * df['gas_used']
+        
+        # Log summary statistics
+        if not df.empty:
+            logger.info(f"\nSummary statistics for {token_symbol}:")
+            logger.info(f"Total transactions: {len(df)}")
+            logger.info(f"Total amount: {df['amount'].sum():,.2f}")
+            logger.info(f"Average amount: {df['amount'].mean():,.2f}")
+        
+        return df
+
+    def analyze_transaction_patterns(self, df: pd.DataFrame) -> dict:
+        """Analyze transaction patterns using pandas"""
+        if df.empty:
+            return {}
+        
+        analysis = {
+            'hourly_volume': df.groupby('hour')['amount'].sum().to_dict(),
+            'daily_patterns': df.groupby('day_of_week')['amount'].agg(['count', 'sum', 'mean']).to_dict(),
+            'gas_statistics': {
+                'mean': float(df['gas_cost'].mean()),
+                'median': float(df['gas_cost'].median()),
+                'std': float(df['gas_cost'].std())
+            }
+        }
+        
+        # Add percentile analysis
+        percentiles = {}
+        for p in [25, 50, 75, 90, 95]:
+            percentiles[f'p{p}'] = float(df['amount'].quantile(p/100))
+        analysis['amount_percentiles'] = percentiles
+        
+        return analysis
+
+    def create_transaction_network(self, transactions: List[dict]) -> nx.DiGraph:
+        """Create a directed graph of transactions for network analysis"""
+        G = nx.DiGraph()
+        
+        for tx in transactions:
+            from_addr = tx['from']
+            to_addr = tx['to']
+            amount = float(self.w3.from_wei(int(tx['value']), 'ether'))
+            
+            if from_addr and to_addr:
+                if G.has_edge(from_addr, to_addr):
+                    # Update existing edge
+                    G[from_addr][to_addr]['weight'] += amount
+                    G[from_addr][to_addr]['count'] += 1
+                else:
+                    # Create new edge
+                    G.add_edge(from_addr, to_addr, weight=amount, count=1)
+        
+        return G
+
+    def analyze_network_metrics(self, df):
+        """Analyze network metrics from transaction data."""
+        G = nx.DiGraph()
+        
+        # Add edges with weights
+        for _, row in df.iterrows():
+            G.add_edge(row['from'], row['to'], weight=float(row['amount']))
+        
+        # Calculate basic network metrics
+        metrics = {
+            'total_nodes': G.number_of_nodes(),
+            'total_edges': G.number_of_edges(),
+            'density': nx.density(G),
+            'largest_component_size': len(max(nx.weakly_connected_components(G), key=len))
+        }
+        
+        # Calculate average clustering if there are enough nodes
+        if G.number_of_nodes() > 2:
+            metrics['avg_clustering'] = nx.average_clustering(G.to_undirected())
+        else:
+            metrics['avg_clustering'] = 0
+        
+        # Calculate weighted in and out degrees
+        weighted_in_degrees = {node: sum(d['weight'] for (u, v, d) in G.in_edges(node, data=True)) 
+                             for node in G.nodes()}
+        weighted_out_degrees = {node: sum(d['weight'] for (u, v, d) in G.out_edges(node, data=True)) 
+                              for node in G.nodes()}
+        
+        # Get top senders and receivers based on weighted degrees
+        top_senders = sorted(weighted_out_degrees.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_receivers = sorted(weighted_in_degrees.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        metrics['top_senders'] = [(addr, amount) for addr, amount in top_senders]
+        metrics['top_receivers'] = [(addr, amount) for addr, amount in top_receivers]
+        
+        return metrics
+
+    async def generate_enhanced_report_async(self, hours: int = 1, quick_mode: bool = False) -> str:
+        """Generate an enhanced report with transaction patterns and network analysis."""
+        try:
+            logger.info(f"\nStarting enhanced analysis for the last {hours} hours (Quick Mode: {quick_mode})...")
+            
+            # Process CHEX transfers
+            logger.info(f"Fetching CHEX transfers since {datetime.now() - timedelta(hours=hours)}")
+            chex_transfers = await self.get_token_transfers_async('CHEX', hours)
+            logger.info(f"Successfully fetched {len(chex_transfers)} CHEX transfers")
+            
+            # Add delay to avoid rate limits
+            await asyncio.sleep(1)
+            
+            # Process DOGE transfers
+            logger.info(f"Fetching DOGE transfers since {datetime.now() - timedelta(hours=hours)}")
+            doge_transfers = await self.get_token_transfers_async('DOGE', hours)
+            logger.info(f"Successfully fetched {len(doge_transfers)} DOGE transfers")
+            
+            total_transfers = len(chex_transfers) + len(doge_transfers)
+            logger.info(f"Processing {total_transfers} total transfers")
+            
+            report = f"""Enhanced Wallet Movement Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Analysis Period: Last {hours} hours
+Analysis Mode: {'Quick' if quick_mode else 'Full'}\n"""
+            
+            # Process each token type
+            for token, transfers in [('CHEX', chex_transfers), ('DOGE', doge_transfers)]:
+                try:
+                    # Create DataFrame
+                    df = self.create_transaction_dataframe(transfers)
+                    
+                    # Analyze patterns
+                    patterns = self.analyze_transaction_patterns(df)
+                    
+                    # Create network and analyze metrics
+                    metrics = self.analyze_network_metrics(df)
+                    
+                    # Add token section to report
+                    report += f"\n=== {token} Analysis ===\n"
+                    report += f"Total Transactions: {len(df):,}\n"
+                    report += f"Total Volume: {df['amount'].sum():,.2f} {token}\n"
+                    report += f"Average Transaction: {df['amount'].mean():,.2f} {token}\n"
+                    
+                    # Add transaction size distribution
+                    report += "\nTransaction Size Distribution:\n"
+                    for percentile, value in patterns['amount_percentiles'].items():
+                        report += f"{percentile} percentile: {value:,.2f} {token}\n"
+                    
+                    # Add hourly activity
+                    report += "\nHourly Activity (Top 5):\n"
+                    for hour, volume in patterns['hourly_volume'].items():
+                        report += f"Hour {hour:02d}:00 - {volume:,.2f} {token}\n"
+                    
+                    # Add gas statistics
+                    report += "\nGas Usage Statistics:\n"
+                    for stat, value in patterns['gas_statistics'].items():
+                        report += f"{stat}: {value:,.2f} wei\n"
+                    
+                    # Add network metrics
+                    report += "\nNetwork Analysis:\n"
+                    report += f"Active Addresses: {metrics['total_nodes']}\n"
+                    report += f"Unique Transfers: {metrics['total_edges']}\n"
+                    report += f"Network Density: {metrics['density']:.4f}\n"
+                    report += f"Largest Component Size: {metrics['largest_component_size']}\n"
+                    
+                    # Add top senders and receivers
+                    report += "\nTop Senders:\n"
+                    for addr, amount in metrics['top_senders']:
+                        label = self.known_addresses.get(addr, 'Unknown Wallet')
+                        report += f"- {addr[:8]}... ({label}): {amount:,.2f} {token}\n"
+                    
+                    report += "\nTop Receivers:\n"
+                    for addr, amount in metrics['top_receivers']:
+                        label = self.known_addresses.get(addr, 'Unknown Wallet')
+                        report += f"- {addr[:8]}... ({label}): {amount:,.2f} {token}\n"
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {token} data: {e}")
+                    report += f"\nError processing {token} data: {e}\n"
+            
+            report += "\n" + "-" * 80 + "\n"
+            
+            # Save report to file
+            filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(filename, 'w') as f:
+                f.write(report)
+            logger.info(f"\nReport saved to {filename}")
+            
+            return report
+        
+        except Exception as e:
+            error_msg = f"Error generating report: {e}"
+            logger.error(error_msg)
+            return error_msg
+
+    async def close(self):
+        """Clean up resources properly"""
+        try:
+            if hasattr(self, 'session') and not self.session.closed:
+                await self.session.close()
+                
+            if hasattr(self, 'thread_pool'):
+                self.thread_pool.shutdown(wait=True)
+                
+            # Wait for any remaining tasks
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}", exc_info=True)
+
+    def load_balance_history(self):
+        """Load historical balance data from file"""
+        try:
+            with open(self.balance_history_file, 'r') as f:
+                self.balance_history = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.balance_history = {}
+            
+    def save_balance_history(self):
+        """Save historical balance data to file"""
+        with open(self.balance_history_file, 'w') as f:
+            json.dump(self.balance_history, f, indent=2)
 
 async def main():
     tracker = None
